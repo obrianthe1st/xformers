@@ -79,6 +79,7 @@ class VisionTransformer(pl.LightningModule):
                         "dropout": attn_pdrop,
                         "causal": False,
                     },
+                    "self_attention": True,
                 },
                 "feedforward_config": {
                     "name": "FusedMLP",

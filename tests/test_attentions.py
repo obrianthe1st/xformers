@@ -3,12 +3,13 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import nullcontext
 from typing import Tuple
 
 import pytest
 import torch
 
-from xformers.components import InProjContainer, InProjParams, MultiHeadDispatch
+from xformers.components import InProjParams, InputProjection, MultiHeadDispatch
 
 # Automatically test all the registered attentions
 from xformers.components.attention import (
@@ -51,6 +52,7 @@ def _get_multihead(
         "num_heads": heads,
         "dim_head": MODEL / heads,
         "num_rules": 2,  # Compositional Attention
+        "r": 0.5,  # make sure that there's something left to drop / random attention
     }
 
     if skip_output_projection:
@@ -177,10 +179,14 @@ def test_kqv_ordering(
 @pytest.mark.parametrize("proj_bias", [False, True])
 @pytest.mark.parametrize("same_sizes", [False, True])
 @pytest.mark.parametrize("same_settings", [False, True])
+@pytest.mark.parametrize("self_attention", [False, True])
 def test_inproj(
-    small_init: bool, proj_bias: bool, same_sizes: bool, same_settings: bool
+    small_init: bool,
+    proj_bias: bool,
+    same_sizes: bool,
+    same_settings: bool,
+    self_attention: bool,
 ):
-
     test_config = {
         "name": "scaled_dot_product",
         "dropout": 0.1,
@@ -197,11 +203,36 @@ def test_inproj(
     in_params = InProjParams(MODEL, MODEL, proj_bias, small_init)
 
     if same_settings:
-        in_proj = InProjContainer(in_params, None, None)
+        in_proj = InputProjection(
+            in_params,
+            None,
+            None,
+            self_attention=self_attention,
+        )
     else:
         out_features = MODEL if same_sizes else MODEL // 2
-        in_params_flip = InProjParams(MODEL, out_features, proj_bias, small_init)
-        in_proj = InProjContainer(in_params, in_params_flip, in_params_flip)
+        in_params_flip = InProjParams(
+            MODEL,
+            out_features,
+            not proj_bias,
+            small_init,
+        )
+
+        # Different settings and self attention is not supported, and should raise
+        context = nullcontext() if not self_attention else pytest.raises(AssertionError)
+
+        with context:
+            in_proj = InputProjection(
+                in_params,
+                in_params_flip,
+                in_params_flip,
+                self_attention=self_attention,
+            )
+
+        if self_attention:
+            return  # done testing this case
+
+        in_proj = InputProjection(in_params, in_params_flip, in_params_flip)
 
     # build a multi head dispatch to test this attention mechanism
     multi_head = MultiHeadDispatch(
@@ -211,6 +242,7 @@ def test_inproj(
         num_heads=1,
         attention=attention,
         in_proj_container=in_proj,
+        self_attention=self_attention,
     )
 
     # Check kqv are not flipped
@@ -225,17 +257,28 @@ def test_inproj(
         dim=1,
     ).expand((BATCH, SEQ, MODEL))
 
-    k = torch.cat(
-        (
-            torch.zeros((1, MODEL // 2)),
-            torch.rand((1, MODEL // 2)),
-        ),
-        dim=1,
-    ).expand((BATCH, SEQ, MODEL))
-    v = torch.rand(BATCH, SEQ, MODEL)
-
     # just check that a FW does not assert out
+    if self_attention:
+        k = q
+        v = q
+
+    else:
+        k = torch.cat(
+            (
+                torch.zeros((1, MODEL // 2)),
+                torch.rand((1, MODEL // 2)),
+            ),
+            dim=1,
+        ).expand((BATCH, SEQ, MODEL))
+        v = torch.rand(BATCH, SEQ, MODEL)
+
     _ = multi_head(query=q, key=k, value=v)
+
+    # Check that self_attention and mismatching inputs asserts out
+    if self_attention:
+        with pytest.raises(AssertionError):
+            v = torch.rand(BATCH, SEQ, MODEL)
+            _ = multi_head(query=q, key=k, value=v)
 
 
 @pytest.mark.parametrize("heads", [1, 4])
