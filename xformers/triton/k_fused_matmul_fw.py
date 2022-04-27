@@ -24,8 +24,16 @@ from triton.ops.matmul_perf_model import early_config_prune, estimate_matmul_tim
 @triton.autotune(
     configs=[
         # basic configs for compute-bound matmuls
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
@@ -113,53 +121,52 @@ def kernel_fma(
     # for rows (resp. col) of C
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
 
     # the memory addresses of elements can follow numpy broadcasting
-    input_ptrs = A + rm[:, None] * stride_im
-    weight_ptrs = B + rn[None, :] * stride_wn
+    input_ptrs = A + ram[:, None] * stride_im
+    weight_ptrs = B + rbn[None, :] * stride_wn
 
     # initialize and iteratively update accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     if BIAS:
-        bias = tl.load(bias + rn, mask=rn < N, other=0.0).to(tl.float32)
+        if EVEN_BLOCKS:
+            bias = tl.load(bias + rn).to(tl.float32)
+        else:
+            bias = tl.load(bias + rn, mask=rn < N, other=0.0).to(tl.float32)
         acc += bias[None, :]
 
     # block level matrix multiplication.
     # We fetch a block memory block from both inputs, matmul and accumulate, then repeat
-
-    if EVEN_BLOCKS:
-        other = None
-        mask_rn = None
-        mask_rm = None
-    else:
-        other = 0.0
+    if not EVEN_BLOCKS:
         mask_rn = rn < N
         mask_rm = rm < M
 
     for i in range(0, K, BLOCK_K):
         rk = tl.arange(0, BLOCK_K) + i
-        if EVEN_BLOCKS:
-            mask_a = None
-            mask_w = None
-        else:
-            mask_a = (rk[None, :] < K) & mask_rm[:, None]   # type: ignore
-            mask_w = (rk[:, None] < K) & mask_rn[None, :]   # type: ignore
 
-        a = tl.load(input_ptrs + rk[None, :], mask=mask_a, other=other)
-        w = tl.load(weight_ptrs + rk[:, None], mask=mask_w, other=other)
+        if EVEN_BLOCKS:
+            a = tl.load(input_ptrs + rk[None, :])
+            w = tl.load(weight_ptrs + rk[:, None])
+        else:
+            a = tl.load(input_ptrs + rk[None, :], mask=(rk[None, :] < K) & mask_rm[:, None], other=0.0)
+            w = tl.load(weight_ptrs + rk[:, None], mask=(rk[:, None] < K) & mask_rn[None, :], other=0.0)
 
         acc += tl.dot(a, w)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
     # optional: save the activation inputs
     if SAVE_ACT_INPUTS:
         act_in_ptrs = ACT_INPUTS + rm[:, None] * stride_om + rn[None, :]
         if EVEN_BLOCKS:
-            mask_act = None
+            tl.store(act_in_ptrs, acc)
         else:
-            mask_act = mask_rm[:, None] & mask_rn[None, :]  # type: ignore
-        tl.store(act_in_ptrs, acc, mask=mask_act)
+            tl.store(act_in_ptrs, acc, mask=mask_rm[:, None] & mask_rn[None, :])
 
     # optional: fused activation (while the data is in shared memory)
     if ACTIVATION:
@@ -168,11 +175,9 @@ def kernel_fma(
     # write back result
     out_ptrs = C + rm[:, None] * stride_om + rn[None, :]
     if EVEN_BLOCKS:
-        mask_out = None
+        tl.store(out_ptrs, acc)
     else:
-        mask_out = mask_rm[:, None] & mask_rn[None, :]  # type: ignore
-
-    tl.store(out_ptrs, acc, mask=mask_out)
+        tl.store(out_ptrs, acc, mask=mask_rm[:, None] & mask_rn[None, :])
 
 
 # Activation needs to be a triton kernel

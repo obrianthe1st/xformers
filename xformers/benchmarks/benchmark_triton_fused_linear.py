@@ -128,6 +128,7 @@ def bench_linear(activations: List[Optional[Activation]]):
                                 ),
                             ),
                         ]:
+                            torch.cuda.empty_cache()
                             time = triton.testing.do_bench(
                                 lambda: testcase.function(a)
                             )[0]
